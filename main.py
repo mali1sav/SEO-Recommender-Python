@@ -481,7 +481,7 @@ def display_analyzed_keywords():
 
         with col[1]:
             # Format: [Keyword] (300 searches/month) 100% relevant.
-            keyword_display = f"**{kw['keyword']}** ({kw['volume']:,} searches/month) {kw['relevancy']}% relevant."
+            keyword_display = f"**{kw['keyword']}** ({kw['volume']:,}) {kw['relevancy']}% relevant."
             st.markdown(f"{keyword_display}", unsafe_allow_html=True)
 
         if selected:
