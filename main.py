@@ -223,7 +223,7 @@ async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     Analyzes keywords and returns relevancy scores with descriptions in Thai.
     """
-    keywords_list = "\n".join([f"{kw.term} ({kw.parsed_volume} searches/month)" for kw in keywords])
+    keywords_list = "\n".join([f"{kw.term} ({kw.parsed_volume})" for kw in keywords])
     prompt = f"""
     Analyze the relevancy of the following keywords:
     {keywords_list}
