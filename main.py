@@ -56,6 +56,31 @@ class SEOPlan(BaseModel):
     content_structure: List[Section]
 
 # Utility Functions
+def parse_keywords(raw_input: str) -> List[Keyword]:
+    """
+    Parses the raw keyword input into a list of Keyword objects.
+    Expects keywords and volumes on alternating lines.
+    """
+    keywords = []
+    lines = [line.strip() for line in raw_input.split('\n') if line.strip()]
+    
+    for i in range(0, len(lines), 2):
+        if i + 1 < len(lines):
+            term = lines[i]
+            volume = lines[i + 1]
+            
+            # Clean up the volume string
+            volume = re.sub(r'[^\d]', '', volume)
+            
+            if term and volume:
+                keywords.append(Keyword(
+                    term=term,
+                    volume=volume,
+                    parsed_volume=int(volume)
+                ))
+    
+    return keywords
+
 def parse_volume(volume_str: str) -> Optional[int]:
     """
     Parses the volume string and converts it to an integer.
@@ -93,45 +118,6 @@ def parse_volume(volume_str: str) -> Optional[int]:
 
     return None
 
-def parse_keywords(raw_input: str) -> List[Keyword]:
-    """
-    Parses the raw keyword input into a list of Keyword objects.
-    Expects keywords and volumes on alternating lines.
-    """
-    if not raw_input:
-        return []
-
-    # Split into lines and remove empty lines
-    lines = [line.strip() for line in raw_input.split('\n') if line.strip()]
-
-    keywords = []
-    for i in range(0, len(lines), 2):
-        # Make sure we have both keyword and volume
-        if i + 1 >= len(lines):
-            break
-
-        term = lines[i].strip()
-        volume_str = lines[i + 1].strip()
-
-        # Parse the volume
-        parsed_volume = parse_volume(volume_str)
-        if parsed_volume is not None:
-            keywords.append(Keyword(
-                term=term,
-                volume=volume_str,
-                parsed_volume=parsed_volume
-            ))
-
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_keywords = []
-    for kw in keywords:
-        if kw.term not in seen:
-            seen.add(kw.term)
-            unique_keywords.append(kw)
-
-    return unique_keywords
-
 def create_session():
     """
     Creates a requests session with retry logic.
@@ -143,6 +129,7 @@ def create_session():
     session.mount("http://", adapter)
     return session
 
+# Create the session early
 session = create_session()
 
 async def call_openrouter(prompt: str, model: str) -> str:
@@ -223,36 +210,37 @@ async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     Analyzes keywords and returns relevancy scores with descriptions in Thai.
     """
+    # Process all keywords at once
     keywords_list = "\n".join([f"{kw.term} ({kw.parsed_volume})" for kw in keywords])
     prompt = f"""
-    Analyze the relevancy of the following keywords:
+    Analyze the relevancy of ALL the following keywords:
     {keywords_list}
 
-    For each keyword, return a JSON array, each object consist:
+    For each keyword, return a JSON array with ALL keywords analyzed. Each object must have:
     1. keyword: [keyword]
     2. volume: [search volume] (integer)
     3. relevancy: relevancy score (integer 0-100)
     4. description: less than 50 characters description explaining why you gave the relevancy score
 
+    Rules for relevancy scoring:
+    - Main definition keywords (with คือ) should get 90-100%
+    - Related application/usage keywords should get 70-90%
+    - Peripheral topics should get 40-70%
+    - Loosely related topics should get below 40%
+
     Example format of the response:
     [
         {{
-            "keyword": "crypto wallet อันไหนดี",
-            "volume": 60,
+            "keyword": "fibonacci คือ",
+            "volume": 700,
             "relevancy": 100,
-            "description": "ตรงกับการเลือกซื้อกระเป๋าเงิน Crypto ที่ดีที่สุด ซึ่งเป็นส่วนสำคัญของบทความ"
-        }},
-        {{
-            "keyword": "crypto wallet คือ",
-            "volume": 40,
-            "relevancy": 90,
-            "description": "อธิบายความหมายของกระเป๋าเงิน Crypto ซึ่งเป็นข้อมูลบทนำพื้นฐานในบทความ"
+            "description": "คำนิยามหลักของ Fibonacci ซึ่งเป็นหัวข้อหลัก"
         }}
     ]
 
+    Return ALL keywords in the JSON array. Do not skip any keywords.
     Only return JSON array, no additional text or explanation.
     """
-
     try:
         result = await call_openrouter(prompt, ANALYSIS_MODEL)
         # Add debug logging
@@ -461,33 +449,45 @@ if 'intent_generated' not in st.session_state:
     st.session_state.intent_generated = False
 
 def display_analyzed_keywords():
-    """Display analyzed keywords with checkboxes and calculate total volume."""
-    if not st.session_state.analyzed_keywords:
+    if 'analyzed_keywords' not in st.session_state:
         return 0
 
     total_volume = 0
-    st.markdown("### Keywords")
-
+    
+    # Display total number of keywords and threshold information
+    st.markdown(f"### Total Keywords: {len(st.session_state.analyzed_keywords)}")
+    st.markdown("Keywords with relevancy ≥ 60% are selected by default")
+    
+    # Create three columns for better organization
+    cols = st.columns([0.1, 0.5, 0.2, 0.2])
+    cols[0].markdown("**Select**")
+    cols[1].markdown("**Keyword**")
+    cols[2].markdown("**Volume**")
+    cols[3].markdown("**Relevancy**")
+    
+    # Display all keywords in a structured format
     for i, kw in enumerate(st.session_state.analyzed_keywords):
-        # Create a unique key using the index only, which is guaranteed to be unique
+        cols = st.columns([0.1, 0.5, 0.2, 0.2])
         unique_key = f"keyword_select_{i}"
         
-        # Display checkbox and keyword info in one line
-        col = st.columns([0.05, 0.95])  # Adjust column widths as needed
-
-        with col[0]:
-            selected = st.checkbox("", key=unique_key, value=st.session_state.keyword_selections.get(unique_key, False))
-            st.session_state.keyword_selections[unique_key] = selected
-
-        with col[1]:
-            # Format: [Keyword] (300 searches/month) 100% relevant.
-            keyword_display = f"**{kw['keyword']}** ({kw['volume']:,}) {kw['relevancy']}% relevant."
-            st.markdown(f"{keyword_display}", unsafe_allow_html=True)
-
+        # Set default selection based on 60% threshold
+        is_selected = kw["relevancy"] >= 60
+        selected = cols[0].checkbox("", key=unique_key, value=is_selected)
+        st.session_state.keyword_selections[unique_key] = selected
+        
+        # Display keyword information in columns
+        cols[1].markdown(f"{kw['keyword']}")
+        cols[2].markdown(f"{kw['volume']:,}")
+        
+        # Color code relevancy based on threshold
+        relevancy_color = "green" if kw["relevancy"] >= 60 else "red"
+        cols[3].markdown(f"<span style='color:{relevancy_color}'>{kw['relevancy']}%</span>", unsafe_allow_html=True)
+        
         if selected:
             total_volume += kw['volume']
-
-    st.markdown(f"**Total Monthly Searches**: {total_volume:,}")
+    
+    st.markdown("---")
+    st.markdown(f"**Total Monthly Search Volume**: {total_volume:,}")
     return total_volume
 
 # Input text area for keywords
@@ -547,8 +547,6 @@ if st.session_state.intent_generated:
             # The main body will handle the display
         except Exception as e:
             st.error(f"Error: {str(e)}")
-            if "Response:" in str(e):
-                st.code(str(e), language="json")
 
 # Display analyzed keywords if they exist (persistent display)
 if st.session_state.analyzed_keywords:
@@ -562,7 +560,6 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                 # Get selected keywords with volumes
                 selected_keywords = []
                 for i, kw in enumerate(st.session_state.analyzed_keywords):
-                    # Construct the key used for selection
                     key_used = f"keyword_select_{i}"
                     if st.session_state.keyword_selections.get(key_used, False):
                         selected_keywords.append(kw)
@@ -570,6 +567,27 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                 if not selected_keywords:
                     st.error("Please select at least one keyword")
                     st.stop()
+
+                # Display summary table of selected keywords
+                st.markdown("### Selected Keywords for SEO Plan")
+                
+                # Create a list of rows for the table
+                table_data = {
+                    "Keyword": [kw['keyword'] for kw in selected_keywords],
+                    "Monthly Volume": [kw['volume'] for kw in selected_keywords]
+                }
+                
+                # Convert to DataFrame for better table display
+                import pandas as pd
+                df = pd.DataFrame(table_data)
+                
+                # Display the table
+                st.table(df)
+                
+                # Display total volume
+                total_volume = sum(kw['volume'] for kw in selected_keywords)
+                st.markdown(f"**Total Monthly Search Volume**: {total_volume:,}")
+                st.markdown("---")
 
                 # Format keywords with volumes for SEO plan
                 keyword_input_str = "\n".join([
