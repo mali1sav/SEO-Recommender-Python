@@ -48,18 +48,72 @@ class Section(BaseModel):
     targetKeywords: list[str]
     relatedConcepts: list[str]
     contentFormat: str
-    details: str  # Merged field
+    details: str
     perplexityLink: str = ""
 
 class SEOPlan(BaseModel):
     title_meta_h1: TitleMetaH1
     content_structure: List[Section]
 
-# Utility Functions
+##############################################################################
+# Updated parse_volume function to handle "1.6K" etc.
+##############################################################################
+def parse_volume(volume_str: str) -> Optional[int]:
+    """
+    Parses the volume string and converts it to an integer.
+    Supports K/M/B suffixes, range formats, and AHREFS-specific formats.
+    E.g.: "1.6K" -> 1600, "10K" -> 10000, "0-10" -> 10, "4.5k" -> 4500
+    """
+    if not volume_str or not isinstance(volume_str, str):
+        return None
+
+    volume_str = volume_str.strip().lower().replace(',', '')
+
+    # Handle K, M, B suffix
+    # 1.6K -> 1600, 2M -> 2000000, 3.5B -> 3500000000
+    match = re.match(r'^(\d+(\.\d+)?)([kmb])$', volume_str)
+    if match:
+        num_str = match.group(1)  # e.g. 1.6
+        suffix = match.group(3)   # e.g. K
+        try:
+            base_val = float(num_str)
+            if suffix == 'k':
+                return int(base_val * 1_000)
+            elif suffix == 'm':
+                return int(base_val * 1_000_000)
+            elif suffix == 'b':
+                return int(base_val * 1_000_000_000)
+        except ValueError:
+            return None
+
+    # Handle range formats like "0-10"
+    if '-' in volume_str:
+        try:
+            start, end = map(str.strip, volume_str.split('-'))
+            # Take the higher number
+            return int(float(end))
+        except ValueError:
+            pass
+
+    # If no suffix or range, try direct integer or float
+    try:
+        return int(float(volume_str))
+    except ValueError:
+        pass
+
+    return None
+
+##############################################################################
+# Updated parse_keywords to call parse_volume instead of stripping all non-digits
+##############################################################################
 def parse_keywords(raw_input: str) -> List[Keyword]:
     """
     Parses the raw keyword input into a list of Keyword objects.
-    Expects keywords and volumes on alternating lines.
+    Expects keywords and volumes on alternating lines, e.g.:
+      line 1: "leverage คือ"
+      line 2: "1.6K"
+      line 3: "leverage ratio คือ"
+      line 4: "200"
     """
     keywords = []
     lines = [line.strip() for line in raw_input.split('\n') if line.strip()]
@@ -67,56 +121,17 @@ def parse_keywords(raw_input: str) -> List[Keyword]:
     for i in range(0, len(lines), 2):
         if i + 1 < len(lines):
             term = lines[i]
-            volume = lines[i + 1]
-            
-            # Clean up the volume string
-            volume = re.sub(r'[^\d]', '', volume)
-            
-            if term and volume:
+            volume_str = lines[i + 1]
+            parsed_vol = parse_volume(volume_str)
+            if parsed_vol is None:
+                parsed_vol = 0  # fallback if parsing fails
+            if term and volume_str:
                 keywords.append(Keyword(
                     term=term,
-                    volume=volume,
-                    parsed_volume=int(volume)
+                    volume=volume_str,
+                    parsed_volume=parsed_vol
                 ))
-    
     return keywords
-
-def parse_volume(volume_str: str) -> Optional[int]:
-    """
-    Parses the volume string and converts it to an integer.
-    Supports K/M/B suffixes, range formats, and AHREFS-specific formats.
-    """
-    if not volume_str or not isinstance(volume_str, str):
-        return None
-
-    # Clean the input string
-    volume_str = volume_str.strip().lower()
-
-    # Handle AHREFS-specific formats
-    if 'k' in volume_str:
-        # Handle cases like "4.5k"
-        try:
-            num = float(volume_str.replace('k', ''))
-            return int(num * 1000)
-        except ValueError:
-            pass
-
-    # Handle range formats like "0-10"
-    if '-' in volume_str:
-        try:
-            start, end = map(str.strip, volume_str.split('-'))
-            # For ranges like "0-10", take the higher number
-            return int(end)
-        except ValueError:
-            pass
-
-    # Try parsing as a simple integer
-    try:
-        return int(volume_str)
-    except ValueError:
-        pass
-
-    return None
 
 def create_session():
     """
@@ -210,7 +225,6 @@ async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     Analyzes keywords and returns relevancy scores with descriptions in Thai.
     """
-    # Process all keywords at once
     keywords_list = "\n".join([f"{kw.term} ({kw.parsed_volume})" for kw in keywords])
     prompt = f"""
     Analyze the relevancy of ALL the following keywords:
@@ -243,18 +257,16 @@ async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     try:
         result = await call_openrouter(prompt, ANALYSIS_MODEL)
-        # Add debug logging
-        print(f"API Response: {result}")
+        print(f"API Response: {result}")  # Debug
 
-        # Try to clean the response if it contains extra text
         result = result.strip()
+        # If response starts with ```json, remove it
         if result.startswith('```json'):
             result = result.replace('```json', '').replace('```', '').strip()
 
-        # Parse JSON
         analysis = json.loads(result)
 
-        # Validate the structure
+        # Validate structure
         for item in analysis:
             required_keys = ['keyword', 'volume', 'relevancy', 'description']
             if not all(key in item for key in required_keys):
@@ -308,22 +320,18 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
 
     Return ONLY the JSON, no other text.
     """
-
     title_response = await call_openrouter(title_prompt, TITLE_MODEL)
     try:
-        # Clean the response if it contains markdown
         title_response = title_response.strip()
         if title_response.startswith('```json'):
             title_response = title_response.replace('```json', '').replace('```', '').strip()
 
         title_meta_h1 = json.loads(title_response)
 
-        # Validate the response
         required_keys = ["title", "metaDescription", "h1"]
         if not all(k in title_meta_h1 for k in required_keys):
             raise ValueError(f"Missing required keys. Got: {list(title_meta_h1.keys())}")
 
-        # Validate string values
         for k in required_keys:
             if not isinstance(title_meta_h1[k], str) or not title_meta_h1[k].strip():
                 raise ValueError(f"Invalid or empty value for {k}")
@@ -379,33 +387,15 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
         ...
     ]
 
-    Example section grouping:
-    1. Introduction/Definition Section:
-       - Groups basic "what is" and definition-related keywords
-       - Establishes foundational understanding
-    2. Core Information Section:
-       - Groups keywords about main features/benefits
-       - Covers essential knowledge
-    3. Detailed Analysis Section:
-       - Groups keywords about specific use cases/comparisons
-       - Provides in-depth information
-    4. Advanced Topics Section:
-       - Groups keywords about advanced concepts
-       - Covers expert-level information
-
     Return ONLY the JSON array, no other text.
     """
-
     structure_response = await call_openrouter(content_structure_prompt, STRUCTURE_MODEL)
     try:
-        # Clean the response if it contains markdown
         structure_response = structure_response.strip()
         if structure_response.startswith('```json'):
             structure_response = structure_response.replace('```json', '').replace('```', '').strip()
 
         content_structure = json.loads(structure_response)
-
-        # Validate the structure
         if not isinstance(content_structure, list):
             raise ValueError("Content structure must be a list")
 
@@ -414,7 +404,6 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
             if not all(key in section for key in required_keys):
                 raise ValueError(f"Missing required keys in section: {list(section.keys())}")
 
-            # Add Perplexity link
             section["perplexityLink"] = f"https://www.perplexity.ai/search?q={'+'.join(section['headingEnglish'].split())}+.+Explain+in+Thai"
 
     except json.JSONDecodeError as e:
@@ -424,13 +413,10 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     except Exception as e:
         raise Exception(f"Error generating content structure: {str(e)}") from e
 
-    # Assemble SEO Plan
-    seo_plan = SEOPlan(
+    return SEOPlan(
         title_meta_h1=TitleMetaH1(**title_meta_h1),
         content_structure=[Section(**section) for section in content_structure]
     )
-
-    return seo_plan
 
 # Streamlit UI
 st.set_page_config(page_title="SEO Content Recommender", layout="wide")
@@ -454,32 +440,26 @@ def display_analyzed_keywords():
 
     total_volume = 0
     
-    # Display total number of keywords and threshold information
     st.markdown(f"### Total Keywords: {len(st.session_state.analyzed_keywords)}")
     st.markdown("Keywords with relevancy ≥ 60% are selected by default")
     
-    # Create three columns for better organization
     cols = st.columns([0.1, 0.5, 0.2, 0.2])
     cols[0].markdown("**Select**")
     cols[1].markdown("**Keyword**")
     cols[2].markdown("**Volume**")
     cols[3].markdown("**Relevancy**")
     
-    # Display all keywords in a structured format
     for i, kw in enumerate(st.session_state.analyzed_keywords):
         cols = st.columns([0.1, 0.5, 0.2, 0.2])
         unique_key = f"keyword_select_{i}"
         
-        # Set default selection based on 60% threshold
         is_selected = kw["relevancy"] >= 60
         selected = cols[0].checkbox("", key=unique_key, value=is_selected)
         st.session_state.keyword_selections[unique_key] = selected
         
-        # Display keyword information in columns
         cols[1].markdown(f"{kw['keyword']}")
         cols[2].markdown(f"{kw['volume']:,}")
         
-        # Color code relevancy based on threshold
         relevancy_color = "green" if kw["relevancy"] >= 60 else "red"
         cols[3].markdown(f"<span style='color:{relevancy_color}'>{kw['relevancy']}%</span>", unsafe_allow_html=True)
         
@@ -490,34 +470,27 @@ def display_analyzed_keywords():
     st.markdown(f"**Total Monthly Search Volume**: {total_volume:,}")
     return total_volume
 
-# Input text area for keywords
 raw_input = st.text_area("Enter your keywords:", height=200)
 
-# First step: Generate Content Intent
 if st.button("Suggest Intent"):
     if raw_input:
         try:
             with st.spinner("Analyzing keywords and generating intent..."):
-                # Create input model and process keywords
                 keyword_input = KeywordInput(raw_input=raw_input)
                 keywords = parse_keywords(raw_input)
 
-                # Generate intent
                 intent_output = asyncio.run(generate_intent(keywords))
 
-                # Store in session state
                 st.session_state.keywords = keywords
                 st.session_state.content_intent = intent_output.intent
                 st.session_state.intent_generated = True
 
-                # Force a rerun to update the UI
                 st.experimental_rerun()
         except Exception as e:
             st.error(f"Error: {str(e)}")
     else:
         st.warning("Please enter some keywords first.")
 
-# Show intent editor if intent was generated
 if st.session_state.intent_generated:
     st.subheader("Content Intent (Thai)")
     edited_intent = st.text_area(
@@ -528,36 +501,27 @@ if st.session_state.intent_generated:
     )
     st.session_state.content_intent = edited_intent
 
-# Show analyze button only if we have keywords
 if st.session_state.intent_generated:
     if st.button("Analyze Keyword Relevancy"):
         try:
             with st.spinner("Analyzing keyword relevancy..."):
-                # Only analyze if we haven't done so yet
                 if not st.session_state.analyzed_keywords:
                     analyzed = asyncio.run(analyze_keyword_relevancy(st.session_state.keywords))
                     st.session_state.analyzed_keywords = analyzed
-                    # Reset and initialize selections with default values
                     st.session_state.keyword_selections = {}
                     for i, kw in enumerate(analyzed):
                         unique_key = f"keyword_select_{i}"
                         st.session_state.keyword_selections[unique_key] = kw['relevancy'] >= 50
-
-            # Removed the call to display_analyzed_keywords() here
-            # The main body will handle the display
         except Exception as e:
             st.error(f"Error: {str(e)}")
 
-# Display analyzed keywords if they exist (persistent display)
 if st.session_state.analyzed_keywords:
     display_analyzed_keywords()
 
-# Only show the SEO Plan button if we have both keywords and intent
 if st.session_state.intent_generated and st.session_state.analyzed_keywords:
     if st.button("Generate Full SEO Plan"):
         try:
             with st.spinner("Generating SEO plan..."):
-                # Get selected keywords with volumes
                 selected_keywords = []
                 for i, kw in enumerate(st.session_state.analyzed_keywords):
                     key_used = f"keyword_select_{i}"
@@ -568,41 +532,30 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                     st.error("Please select at least one keyword")
                     st.stop()
 
-                # Display summary table of selected keywords
                 st.markdown("### Selected Keywords for SEO Plan")
-                
-                # Create a list of rows for the table
                 table_data = {
                     "Keyword": [kw['keyword'] for kw in selected_keywords],
                     "Monthly Volume": [kw['volume'] for kw in selected_keywords]
                 }
-                
-                # Convert to DataFrame for better table display
-                import pandas as pd
                 df = pd.DataFrame(table_data)
-                
-                # Display the table
                 st.table(df)
-                
-                # Display total volume
+
                 total_volume = sum(kw['volume'] for kw in selected_keywords)
                 st.markdown(f"**Total Monthly Search Volume**: {total_volume:,}")
                 st.markdown("---")
 
-                # Format keywords with volumes for SEO plan
                 keyword_input_str = "\n".join([
                     f"{kw['keyword']}|{kw['volume']}"
                     for kw in selected_keywords
                 ])
 
-                # Generate SEO plan
                 seo_plan = asyncio.run(full_seo_plan(KeywordInput(raw_input=keyword_input_str)))
 
-                # Display SEO plan
                 st.markdown("## SEO Content Plan")
                 st.markdown(f"**Title**: {seo_plan.title_meta_h1.title}")
                 st.markdown(f"**Meta Description**: {seo_plan.title_meta_h1.metaDescription}")
                 st.markdown(f"**H1**: {seo_plan.title_meta_h1.h1}")
+
                 st.markdown("## Content Structure")
                 for section in seo_plan.content_structure:
                     heading = re.sub(r'\s*\(\d+\)\s*', '', section.heading)
@@ -613,6 +566,5 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                     st.markdown(f"**Guidelines**: {section.details}")
                     st.markdown(f"**Research**: [{section.perplexityLink}]({section.perplexityLink})")
                     st.markdown("---")
-
         except Exception as e:
             st.error(f"Error: {str(e)}")
