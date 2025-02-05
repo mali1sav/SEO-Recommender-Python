@@ -1,30 +1,44 @@
 import os
 import re
 import json
-from typing import List, Dict, Optional
+import time
+
+import requests
+from requests.adapters import Retry, HTTPAdapter
+from typing import List, Dict, Optional, Union
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-import requests
-from requests.adapters import HTTPAdapter, Retry
 import streamlit as st
-import asyncio
-import pandas as pd
-import hashlib
-from typing import Union
+import google.generativeai as genai
+import tenacity
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Constants and Configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-if not OPENROUTER_API_KEY:
-    raise EnvironmentError("OPENROUTER_API_KEY not set in environment variables.")
+# Initialize Gemini client
+def init_gemini_client():
+    """Initialize Google Gemini client."""
+    try:
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            st.error("Gemini API key not found. Please set GEMINI_API_KEY in your environment variables.")
+            return None
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-ANALYSIS_MODEL = "anthropic/claude-3.5-sonnet:beta"
-INTENT_MODEL = "anthropic/claude-3.5-sonnet:beta"
-TITLE_MODEL = "openai/gpt-4o-2024-11-20"
-STRUCTURE_MODEL = "anthropic/claude-3.5-sonnet:beta"
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        return {
+            'model': model,
+            'name': 'gemini-2.0-flash-exp'
+        }
+    except Exception as e:
+        st.error(f"Failed to initialize Gemini client: {str(e)}")
+        return None
+
+# Initialize Gemini client
+gemini_client = init_gemini_client()
+if not gemini_client:
+    raise EnvironmentError("Failed to initialize Gemini client.")
 
 # Define Pydantic Models
 class KeywordInput(BaseModel):
@@ -36,7 +50,8 @@ class Keyword(BaseModel):
     parsed_volume: int
 
 class IntentOutput(BaseModel):
-    intent: str
+    intents: List[str]
+    selected_intent: Optional[str] = None
 
 class TitleMetaH1(BaseModel):
     title: str
@@ -137,123 +152,119 @@ def create_session():
     session.mount("http://", adapter)
     return session
 
-async def extract_promotional_entities(intent: str) -> List[str]:
+def extract_promotional_entities(intent: str) -> List[str]:
     """
-    Uses the LLM to extract promotional entities (e.g., URLs, brand names, coin names, crypto presales, wallets, affiliate partners) from the search intent.
+    Rotates promotional entities with brand rotation list.
     """
-    prompt = f"""
-    Analyze the following search intent and extract all promotional entities (e.g., URLs, brand names, coin names, crypto presales, wallets, affiliate partners):
-
-    Search Intent: "{intent}"
-
-    Return the entities as a JSON array. Only include entities that are clearly promotional or brand-related. Do not include generic terms or common words.
-
-    Example format of the response:
-    ["Bestwallet.com/th", "Solana", "MetaMask", "Binance"]
-
-    Return ONLY the JSON array, no additional text or explanation.
-    """
-
-    try:
-        result = await call_openrouter(prompt, ANALYSIS_MODEL)
-        # Clean the response if it contains markdown
-        result = result.strip()
-        if result.startswith('```json'):
-            result = result.replace('```json', '').replace('```', '').strip()
-
-        # Parse JSON
-        entities = json.loads(result)
-
-        # Validate the structure
-        if not isinstance(entities, list):
-            raise ValueError("Expected a JSON array of entities.")
-
-        return entities
-    except json.JSONDecodeError as e:
-        raise Exception(f"Failed to parse API response as JSON. Response: {result[:200]}...") from e
-    except ValueError as e:
-        raise Exception(f"Invalid response format: {str(e)}") from e
-    except Exception as e:
-        raise Exception(f"Error extracting promotional entities: {str(e)}") from e
+    # Get rotating index based on current time
+    idx = int(time.time()) % len(BRAND_ROTATION)
+    return BRAND_ROTATION[idx:idx+2]  # Return 2 rotating brands
 
 # Create the session early
 session = create_session()
 
-async def call_openrouter(prompt: str, model: str) -> str:
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential(multiplier=1, min=4, max=20),
+    retry=tenacity.retry_if_exception_type((Exception)),
+    retry_error_callback=lambda retry_state: None
+)
+def make_gemini_request(prompt: str) -> str:
+    """Make Gemini API request with retries and proper error handling"""
+    try:
+        # Add retry logic for Gemini API
+        for attempt in range(3):
+            try:
+                response = gemini_client['model'].generate_content(prompt)
+                if response and response.text:
+                    return response.text
+            except Exception as e:
+                if attempt == 2:  # Last attempt
+                    raise
+                st.warning(f"Retrying Gemini request (attempt {attempt + 2}/3)...")
+                time.sleep(2 ** attempt)  # Exponential backoff
+
+        raise Exception("Failed to get valid response from Gemini API after all retries")
+
+    except Exception as e:
+        st.error(f"Error making Gemini request: {str(e)}")
+        raise
+
+CONTENT_TYPES = [
+    "Listicle", 
+    "How-To Guide",
+    "Comparison Article",
+    "Expert Insights",
+    "Problem-Solving"
+]
+
+CONTENT_STRUCTURES = [
+    "Table-based comparison",
+    "Step-by-step guide",
+    "Checklist format", 
+    "Case Study/Storytelling",
+    "Q&A format"
+]
+
+BRAND_ROTATION = [
+    "BestWallet.com/th",
+    "MetaMask",
+    "Trust Wallet",
+    "Binance Wallet",
+    "Coinbase Wallet"
+]
+
+def rotate_keywords(keywords: List[Keyword], num_groups=5) -> List[List[str]]:
+    """Split keywords into rotating groups"""
+    return [keywords[i::num_groups] for i in range(num_groups)]
+
+def generate_intent(keywords: List[Keyword]) -> IntentOutput:
     """
-    Calls the OpenRouter API with the given prompt and model.
-    """
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "https://github.com/your-username/seo-recommender",  # Replace with your actual URL
-        "X-Title": "SEO Content Recommender"
-    }
-
-    data = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    }
-
-    for attempt in range(3):
-        try:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: session.post(
-                    f"{OPENROUTER_BASE_URL}/chat/completions",
-                    headers=headers,
-                    json=data
-                )
-            )
-            response.raise_for_status()
-            result = response.json()
-
-            if "choices" in result and len(result["choices"]) > 0:
-                return result["choices"][0]["message"]["content"]
-            else:
-                raise ValueError("Invalid response format from OpenRouter.")
-        except Exception as e:
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            else:
-                raise Exception(f"OpenRouter API call failed: {str(e)}")
-
-async def generate_intent(keywords: List[Keyword]) -> IntentOutput:
-    """
-    Generates content intent based on the list of keywords.
+    Generates content intent with enforced content types.
     """
     if not keywords:
         raise Exception("Keyword list is empty.")
+        
     keywords_list = "\n".join([kw.term for kw in keywords])
     prompt = f"""
-    You are an SEO expert analyzing a list of Thai keywords to suggest a comprehensive content intent. The intent should cover all major aspects indicated by the keywords while maintaining natural language flow.
+    Generate 5 distinct Thai content intents. Feel free to use these example formats or better ones:
 
-    Keywords to analyze:
-    {keywords_list}
+    1. Listicle: "10 ข้อควรรู้เกี่ยวกับ [main keyword]" 
+    2. How-To: "วิธี [action] [main keyword] แบบมืออาชีพ"
+    3. Comparison: "[option1] vs [option2] ต่างกันอย่างไร?"
+    4. Expert: "ผู้เชี่ยวชาญเผย [insight] เกี่ยวกับ [main keyword]"
+    5. Problem-Solving: "แก้ไขปัญหา [common issue] ด้วย [solution]"
 
-    Based on these keywords, generate a content intent in Thai that:
-    1. Captures the main topic and its key aspects
-    2. Addresses the implied user questions and search intent
+    Keywords: {keywords_list}
+
+    Return EXACTLY 5 intents matching these formats in Thai:
+    1. Captures the main topic from a unique angle or perspective
+    2. Addresses different implied user questions and search intents
     3. Provides a logical flow for content structure
-    4. Use natural Thai language while retaining SEO keywords in their original form, whether they are in Thai or English
+    4. Uses natural Thai language while retaining SEO keywords in their original form, whether they are in Thai or English
     5. Is comprehensive but concise (around 1-2 sentences)
 
-    Return ONLY the suggested intent in Thai, with no additional text or explanation.
+    Return EXACTLY 5 intents in Thai, one per line, numbered from 1-5. No additional text or explanation.
 
     Example format of the response:
-    ข้อมูล [topic] ใน[context], [aspect1], [aspect2], และ[aspect3]
+    1. ข้อมูล [topic] ใน[context], [aspect1], [aspect2], และ[aspect3]
+    2. วิธีการ [topic] สำหรับ[target], [benefit1], [benefit2], และ[benefit3]
+    3. เปรียบเทียบ [topic] ระหว่าง[option1], [option2], และ[option3]
+    4. แนวทางการ [topic] ที่[characteristic], [feature1], [feature2]
+    5. ความสำคัญของ [topic] ต่อ[impact1], [impact2], และ[impact3]
     """
-    intent = await call_openrouter(prompt, INTENT_MODEL)
-    if not intent:
-        raise Exception("Failed to generate intent.")
-    return IntentOutput(intent=intent)
+    intent_response = make_gemini_request(prompt)
+    if not intent_response:
+        raise Exception("Failed to generate intents.")
+    
+    # Split the response into individual intents
+    intents = [line.strip() for line in intent_response.split('\n') if line.strip()]
+    # Remove any numbering prefix (e.g., '1. ', '2. ')
+    intents = [re.sub(r'^\d+\.\s*', '', intent) for intent in intents]
+    
+    return IntentOutput(intents=intents)
 
-async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
+def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     Analyzes keywords and returns relevancy scores with descriptions in Thai.
     """
@@ -292,11 +303,11 @@ async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     Only return JSON array, no additional text or explanation.
     """
     try:
-        result = await call_openrouter(prompt, ANALYSIS_MODEL)
-        # Add debug logging
+        result = make_gemini_request(prompt)
+        # Debug logging
         print(f"API Response: {result}")
 
-        # Try to clean the response if it contains extra text
+        # Clean the response if it contains extra text
         result = result.strip()
         if result.startswith('```json'):
             result = result.replace('```json', '').replace('```', '').strip()
@@ -320,7 +331,7 @@ async def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     except Exception as e:
         raise Exception(f"Error analyzing keywords: {str(e)}") from e
 
-async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
+def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     """
     Complete workflow to generate SEO plan from raw keyword input.
     """
@@ -338,7 +349,7 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     main_keyword = keywords[0]["term"]
 
     # Step 2: Detect promotional entities in the search intent using LLM
-    promotional_entities = await extract_promotional_entities(st.session_state.content_intent)
+    promotional_entities = extract_promotional_entities(st.session_state.content_intent)
 
     # Step 3: Generate Title, Meta, and H1 with focus on main keyword
     title_prompt = f"""
@@ -349,7 +360,7 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     Search Intent: {st.session_state.content_intent}  # <-- Pass the intent here
 
     Generate a title, meta description, and H1 in Thai that:
-    1. Naturally integrates the main keyword early in each element
+    1. Naturally integrates {main_keyword} early in each element
     2. Uses supporting keywords where natural
     3. Is compelling, engaging and click-worthy
     4. Stays within character limits (title: 60 chars, meta: 155 chars)
@@ -365,7 +376,7 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     Return ONLY the JSON, no other text.
     """
 
-    title_response = await call_openrouter(title_prompt, TITLE_MODEL)
+    title_response = make_gemini_request(title_prompt)
     try:
         # Clean the response if it contains markdown
         title_response = title_response.strip()
@@ -409,10 +420,9 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
        - Core Concepts & Main Information
        - Detailed Analysis & Advanced Topics
        - Related Subtopics and Additional Insights
-       - FAQs (as a dedicated section)
     4. If the search intent mentions any promotional entities (e.g., {', '.join(promotional_entities)}), integrate them naturally into the content sections without being overly promotional. Specifically:
-    - Mention the promotional entity (e.g., {', '.join(promotional_entities)}) in at least one section's guidelines or details.
-    - Ensure the mention feels natural and adds value to the content.
+       - Mention the promotional entity (e.g., {', '.join(promotional_entities)}) in at least one section's guidelines or details.
+       - Ensure the mention feels natural and adds value to the content.
 
     For each section (except FAQs):
     1. Create an H2 heading in Thai that:
@@ -421,13 +431,13 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
        - Incorporates relevant keywords naturally (no forced usage).
        - Avoids redundant or repetitive terms
        - Expands into a natural sentence when using multiple keywords.
-       - Flows logically from the previous heading
-       - Includes 1 or 2 semantically relevant topics to enrich the content while maintaining alignment with the article's intent.
-    2. Provide the English translation of the H2 for Perplexity search
-    3. List target keywords with their search volumes that belong in this section
-    4. Combine reasoning, context, and guidelines into a single 'Details' field explaining the section's purpose and how to handle it
-    5. List 3-5 related concepts to enhance semantic coverage.
-    6. Suggest the best content format (e.g., paragraphs, lists, tables, step-by-step guides)
+       - Flows logically from the previous heading.
+    2. Includes additional 1 or 2 semantically relevant content sections including {main_keyword} or select other keywords to enrich the content while maintaining alignment with the article's intent. 
+    3. Provide the English translation of the H2 for Perplexity search.
+    4. List target keywords with their search volumes that belong in this section.
+    5. Combine reasoning, context, and guidelines into a single 'Details' field explaining the section's purpose and how to handle it.
+    6. List 3-5 related concepts to enhance semantic coverage.
+    7. Suggest the best content format (e.g., paragraphs, lists, tables, step-by-step guides).
 
     For the **FAQs section**:
     1. Create an H2 heading in Thai: "คำถามที่พบบ่อยเกี่ยวกับ [main keyword]"
@@ -453,8 +463,8 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
         {{
             "heading": "คำถามที่พบบ่อยเกี่ยวกับ [main keyword]",
             "headingEnglish": "Frequently Asked Questions About [main keyword]",
-            "targetKeywords": [],  # No target keywords for FAQs
-            "relatedConcepts": [],  # No related concepts for FAQs
+            "targetKeywords": [],
+            "relatedConcepts": [],
             "contentFormat": "Q&A format",
             "details": [
                 {{
@@ -464,12 +474,12 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
                 {{
                     "question": "Question 2 in Thai",
                     "researchLink": "https://www.perplexity.ai/search?q=English+translation+of+question+2+briefly+explain+in+Thai"
-                }},
-                ...
+                }}
+                // More questions...
             ],
             "perplexityLink": "https://www.perplexity.ai/search?q=Frequently+Asked+Questions+About+[main keyword]+.+Explain+in+Thai"
-        }},
-        ...
+        }}
+        // More sections if needed...
     ]
 
     Example section grouping:
@@ -493,7 +503,7 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     Return ONLY the JSON array, no other text.
     """
 
-    structure_response = await call_openrouter(content_structure_prompt, STRUCTURE_MODEL)
+    structure_response = make_gemini_request(content_structure_prompt)
     try:
         # Clean the response if it contains markdown
         structure_response = structure_response.strip()
@@ -536,6 +546,14 @@ async def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
 st.set_page_config(page_title="SEO Content Recommender", layout="wide")
 st.title("SEO Content Recommender")
 
+# Add radio button to select brief type (Internal by default)
+brief_type = st.radio(
+    "Select Brief Type:",
+    options=["Internal", "External"],
+    index=0,
+    key="brief_type"
+)
+
 # Initialize session state variables if they don't exist
 if 'analyzed_keywords' not in st.session_state:
     st.session_state.analyzed_keywords = []
@@ -554,32 +572,24 @@ def display_analyzed_keywords():
 
     total_volume = 0
     
-    # Display total number of keywords and threshold information
     st.markdown(f"### Total Keywords: {len(st.session_state.analyzed_keywords)}")
     st.markdown("Keywords with relevancy ≥ 60% are selected by default")
     
-    # Create three columns for better organization
     cols = st.columns([0.1, 0.5, 0.2, 0.2])
     cols[0].markdown("**Select**")
     cols[1].markdown("**Keyword**")
     cols[2].markdown("**Volume**")
     cols[3].markdown("**Relevancy**")
     
-    # Display all keywords in a structured format
     for i, kw in enumerate(st.session_state.analyzed_keywords):
         cols = st.columns([0.1, 0.5, 0.2, 0.2])
         unique_key = f"keyword_select_{i}"
-        
-        # Set default selection based on 60% threshold
         is_selected = kw["relevancy"] >= 60
         selected = cols[0].checkbox("", key=unique_key, value=is_selected)
         st.session_state.keyword_selections[unique_key] = selected
         
-        # Display keyword information in columns
         cols[1].markdown(f"{kw['keyword']}")
         cols[2].markdown(f"{kw['volume']:,}")
-        
-        # Color code relevancy based on threshold
         relevancy_color = "green" if kw["relevancy"] >= 60 else "red"
         cols[3].markdown(f"<span style='color:{relevancy_color}'>{kw['relevancy']}%</span>", unsafe_allow_html=True)
         
@@ -598,31 +608,37 @@ if st.button("Suggest Intent"):
     if raw_input:
         try:
             with st.spinner("Analyzing keywords and generating intent..."):
-                # Create input model and process keywords
                 keyword_input = KeywordInput(raw_input=raw_input)
                 keywords = parse_keywords(raw_input)
 
-                # Generate intent
-                intent_output = asyncio.run(generate_intent(keywords))
+                intent_output = generate_intent(keywords)
 
-                # Store in session state
                 st.session_state.keywords = keywords
-                st.session_state.content_intent = intent_output.intent
+                st.session_state.content_intents = intent_output.intents
                 st.session_state.intent_generated = True
 
-                # Force a rerun to update the UI
                 st.experimental_rerun()
         except Exception as e:
             st.error(f"Error: {str(e)}")
     else:
         st.warning("Please enter some keywords first.")
 
-# Show intent editor if intent was generated
+# Show intent selection if intents were generated
 if st.session_state.intent_generated:
-    st.subheader("Content Intent:")
+    st.subheader("Select Content Intent:")
+    st.write("Choose one of the following content intents that best matches your goals:")
+    
+    selected_intent = st.radio(
+        "Available Intents:",
+        options=st.session_state.content_intents,
+        index=0,
+        format_func=lambda x: f"{x}",
+        key="intent_selector"
+    )
+    
     edited_intent = st.text_area(
-        "",
-        value=st.session_state.content_intent,
+        "Review and edit the selected content intent if needed:",
+        value=selected_intent,
         height=100,
         key="intent_editor"
     )
@@ -633,22 +649,16 @@ if st.session_state.intent_generated:
     if st.button("Analyze Keyword Relevancy"):
         try:
             with st.spinner("Analyzing keyword relevancy..."):
-                # Only analyze if we haven't done so yet
                 if not st.session_state.analyzed_keywords:
-                    analyzed = asyncio.run(analyze_keyword_relevancy(st.session_state.keywords))
+                    analyzed = analyze_keyword_relevancy(st.session_state.keywords)
                     st.session_state.analyzed_keywords = analyzed
-                    # Reset and initialize selections with default values
                     st.session_state.keyword_selections = {}
                     for i, kw in enumerate(analyzed):
                         unique_key = f"keyword_select_{i}"
                         st.session_state.keyword_selections[unique_key] = kw['relevancy'] >= 50
-
-            # Removed the call to display_analyzed_keywords() here
-            # The main body will handle the display
         except Exception as e:
             st.error(f"Error: {str(e)}")
 
-# Display analyzed keywords if they exist (persistent display)
 if st.session_state.analyzed_keywords:
     display_analyzed_keywords()
 
@@ -657,7 +667,6 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
     if st.button("Generate Full SEO Plan"):
         try:
             with st.spinner("Generating SEO plan..."):
-                # Get selected keywords with volumes
                 selected_keywords = []
                 for i, kw in enumerate(st.session_state.analyzed_keywords):
                     key_used = f"keyword_select_{i}"
@@ -668,27 +677,21 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                     st.error("Please select at least one keyword")
                     st.stop()
 
-
-                # Display summary of selected keywords using Markdown lists
                 st.markdown("### Selected Keywords")
                 for kw in selected_keywords:
                     st.markdown(f"- **{kw['keyword']}**: {kw['volume']:,}")
 
-                # Display total volume
                 total_volume = sum(kw['volume'] for kw in selected_keywords)
                 st.markdown(f"**Total Monthly Search Volume**: {total_volume:,}")
                 st.markdown("---")
 
-                # Format keywords with volumes for SEO plan
                 keyword_input_str = "\n".join([
                     f"{kw['keyword']}|{kw['volume']}"
                     for kw in selected_keywords
                 ])
 
-                # Generate SEO plan
-                seo_plan = asyncio.run(full_seo_plan(KeywordInput(raw_input=keyword_input_str)))
+                seo_plan = full_seo_plan(KeywordInput(raw_input=keyword_input_str))
 
-                # Display SEO plan
                 st.markdown("## SEO Content Plan")
                 st.markdown(f"**Title**: {seo_plan.title_meta_h1.title}")
                 st.markdown(f"**Meta Description**: {seo_plan.title_meta_h1.metaDescription}")
@@ -698,7 +701,6 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                     heading = re.sub(r'\s*\(\d+\)\s*', '', section.heading)
                     st.markdown(f"## **{heading}**")
                     
-                    # Display Target Keywords with black label and green keywords
                     target_keywords = "<span style='color: black;'>, </span>  ".join(section.targetKeywords)
                     st.markdown(
                         f"""
@@ -711,17 +713,45 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                     st.markdown("**Related Concepts**: " + ", ".join(section.relatedConcepts))
                     st.markdown(f"**Content Format**: {section.contentFormat}")
                     
-                    # Handle FAQ section differently
-                    if isinstance(section.details, list):  # Check if details is a list (FAQ section)
-                        st.markdown("**Guidelines**:")
+                    # For FAQ section (where details is a list) or regular sections,
+                    # only show perplexity/research links for Internal briefs.
+                    if isinstance(section.details, list):  # FAQ section
+                        st.markdown("**Guidelines:**")
                         for qa in section.details:
                             st.markdown(f"- **{qa['question']}**")
-                            st.markdown(f"  Research: [{qa['researchLink']}]({qa['researchLink']})")
+                            if st.session_state.brief_type == "Internal":
+                                st.markdown(f"  Research: [{qa['researchLink']}]({qa['researchLink']})")
                     else:  # Regular section
-                        st.markdown(f"**Guidelines**: {section.details}")
-                        st.markdown(f"**Research**: [{section.perplexityLink}]({section.perplexityLink})")  # Only for non-FAQ sections
+                        st.markdown(f"**Guidelines:** {section.details}")
+                        if st.session_state.brief_type == "Internal":
+                            st.markdown(f"**Research:** [{section.perplexityLink}]({section.perplexityLink})")
                     
                     st.markdown("---")
 
+                # Append extra guidelines if the brief is External
+                if st.session_state.brief_type == "External":
+                    external_guidelines = """
+กฎหลักๆ:
+- เนื้อหาความยาว ประมาณ 2000 คำ
+- ในแต่ละหัวข้อ ใช้แต่ละคีย์ แค่ 1-2 ครั้ง
+- หลีกเลี่ยงการคัดลอกเนื้อหาจาก AI
+- หาภาพประกอบความละเอียดสูง (>1200px) 
+- ใช้อ้างอิงจากเว็บไซต์น่าเชื่อถือด้วย in-text citation ไม่เน้นการอ้างอิงท้ายบทความ
+
+วิธีที่ถูกต้อง:
+USDT หรือ Tether เป็นสกุลเงินดิจิทัลประเภท stablecoin ที่มีมูลค่าผูกติดกับดอลลาร์สหรัฐฯ โดยมีจุดประสงค์เพื่อรักษาเสถียรภาพของมูลค่าให้เท่ากับ 1 ดอลลาร์สหรัฐฯ ต่อ 1 USDT (Investopedia)
+
+วิธีที่ไม่ถูกต้อง:
+USDT หรือ Tether เป็นสกุลเงินดิจิทัลประเภท stablecoin ที่มีมูลค่าผูกติดกับดอลลาร์สหรัฐฯ โดยมีจุดประสงค์เพื่อรักษาเสถียรภาพของมูลค่าให้เท่ากับ 1 ดอลลาร์สหรัฐฯ ต่อ 1 USDT
+
+……….
+
+อ้างอิง:
+- https://www.investopedia.com/
+- https://www.techopedia.com/th
+"""
+                    st.markdown("## Additional Guidelines for External Brief")
+                    st.markdown(external_guidelines)
+                    
         except Exception as e:
             st.error(f"Error: {str(e)}")
