@@ -1,6 +1,6 @@
-openai
-python-dotenv
 requests
-streamlit
+python-dotenv
 pydantic
-pandas
+streamlit
+google-generativeai
+tenacity
