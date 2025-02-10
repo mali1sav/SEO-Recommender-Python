@@ -210,13 +210,15 @@ def rotate_keywords(keywords: List[Keyword], num_groups=5) -> List[List[str]]:
 def generate_intent(keywords: List[Keyword]) -> IntentOutput:
     """
     Generates content intent with enforced content types.
+    Modified to generate longer, more detailed intents (around 2-3 sentences)
+    to guide the content structure more comprehensively.
     """
     if not keywords:
         raise Exception("Keyword list is empty.")
         
     keywords_list = "\n".join([kw.term for kw in keywords])
     prompt = f"""
-    Generate 5 distinct Thai content intents. Feel free to use these example formats or better ones:
+    Generate 5 distinct Thai content intents that are comprehensive and detailed (around 2-3 sentences each). You can use the following example formats or come up with better ones:
 
     1. Listicle: "10 ข้อควรรู้เกี่ยวกับ [main keyword]" 
     2. How-To: "วิธี [action] [main keyword] แบบมืออาชีพ"
@@ -226,21 +228,21 @@ def generate_intent(keywords: List[Keyword]) -> IntentOutput:
 
     Keywords: {keywords_list}
 
-    Return EXACTLY 5 intents matching these formats in Thai:
-    1. Captures the main topic from a unique angle or perspective
-    2. Addresses different implied user questions and search intents
-    3. Provides a logical flow for content structure
-    4. Uses natural Thai language while retaining SEO keywords in their original form, whether they are in Thai or English
-    5. Is comprehensive but concise (around 1-2 sentences)
+    Return EXACTLY 5 intents in Thai that:
+    1. Captures the main topic from a unique and engaging angle
+    2. Addresses a variety of user questions and search intents
+    3. Provides a detailed flow for content structure with context and additional information
+    4. Uses natural Thai language while retaining SEO keywords in their original form, whether in Thai or English
+    5. Is comprehensive and detailed (around 2-3 sentences) to help in generating a rich content structure
 
-    Return EXACTLY 5 intents in Thai, one per line, numbered from 1-5. No additional text or explanation.
+    Return EXACTLY 5 intents in Thai, one per line, numbered from 1-5. Do not include any extra explanation.
 
     Example format of the response:
-    1. ข้อมูล [topic] ใน[context], [aspect1], [aspect2], และ[aspect3]
-    2. วิธีการ [topic] สำหรับ[target], [benefit1], [benefit2], และ[benefit3]
-    3. เปรียบเทียบ [topic] ระหว่าง[option1], [option2], และ[option3]
-    4. แนวทางการ [topic] ที่[characteristic], [feature1], [feature2]
-    5. ความสำคัญของ [topic] ต่อ[impact1], [impact2], และ[impact3]
+    1. ข้อมูลเกี่ยวกับ [topic] ใน [context] พร้อมเจาะลึกคุณสมบัติและวิธีเลือกใช้งานที่เหมาะสม
+    2. วิธีการ [action] สำหรับ [target] ที่ช่วยเพิ่มประสิทธิภาพและตอบโจทย์ความต้องการอย่างครบถ้วน
+    3. เปรียบเทียบ [topic] ระหว่าง [option1], [option2], และ [option3] พร้อมวิเคราะห์ข้อดีข้อเสียอย่างละเอียด
+    4. แนวทางการ [topic] ที่ช่วยให้เข้าใจในเชิงลึก พร้อมแนะนำเทคนิคและวิธีการปฏิบัติจริง
+    5. ความสำคัญของ [topic] ในบริบทของ [impact] พร้อมให้ข้อมูลที่ครบถ้วนและแนวทางการปรับปรุงในอนาคต
     """
     intent_response = make_gemini_request(prompt)
     if not intent_response:
