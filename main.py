@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+from urllib.parse import quote_plus  # สำหรับการเข้ารหัส URL
 
 import requests
 from requests.adapters import Retry, HTTPAdapter
@@ -92,8 +93,8 @@ def parse_keywords(raw_input: str) -> List[Keyword]:
             # Include the keyword even if the volume is None
             keywords.append(Keyword(
                 term=term,
-                volume=volume_str,  # Keep the original volume string
-                parsed_volume=parsed_volume if parsed_volume is not None else 0  # Default to 0 if parsing fails
+                volume=volume_str,  # เก็บค่า volume แบบเดิม
+                parsed_volume=parsed_volume if parsed_volume is not None else 0  # กำหนดเป็น 0 ถ้าไม่ parse ได้
             ))
     
     return keywords
@@ -108,38 +109,31 @@ def parse_volume(volume_str: str) -> Optional[int]:
     if not volume_str or not isinstance(volume_str, str):
         return None
 
-    # Clean the input string
     volume_str = volume_str.strip().lower()
 
-    # Handle special cases
     if volume_str == "0-10" or volume_str == "keyword not indexed in ahrefs database":
-        return 10  # Treat these cases as 10
+        return 10
 
-    # Handle AHREFS-specific formats (e.g., "3.3K")
     if 'k' in volume_str:
         try:
-            # Remove 'k' and convert to float, then multiply by 1000
             num = float(volume_str.replace('k', '').replace(',', ''))
             return int(num * 1000)
         except ValueError:
             pass
 
-    # Handle range formats like "0-10"
     if '-' in volume_str:
         try:
             start, end = map(str.strip, volume_str.split('-'))
-            # For ranges like "0-10", take the higher number
             return int(end)
         except ValueError:
             pass
 
-    # Try parsing as a simple integer
     try:
-        return int(volume_str.replace(',', ''))  # Remove commas for numbers like "1,000"
+        return int(volume_str.replace(',', ''))
     except ValueError:
         pass
 
-    return None  # Return None if parsing fails
+    return None
 
 def create_session():
     """
@@ -156,11 +150,9 @@ def extract_promotional_entities(intent: str) -> List[str]:
     """
     Rotates promotional entities with brand rotation list.
     """
-    # Get rotating index based on current time
     idx = int(time.time()) % len(BRAND_ROTATION)
-    return BRAND_ROTATION[idx:idx+2]  # Return 2 rotating brands
+    return BRAND_ROTATION[idx:idx+2]
 
-# Create the session early
 session = create_session()
 
 @tenacity.retry(
@@ -172,20 +164,17 @@ session = create_session()
 def make_gemini_request(prompt: str) -> str:
     """Make Gemini API request with retries and proper error handling"""
     try:
-        # Add retry logic for Gemini API
         for attempt in range(3):
             try:
                 response = gemini_client['model'].generate_content(prompt)
                 if response and response.text:
                     return response.text
             except Exception as e:
-                if attempt == 2:  # Last attempt
+                if attempt == 2:
                     raise
                 st.warning(f"Retrying Gemini request (attempt {attempt + 2}/3)...")
-                time.sleep(2 ** attempt)  # Exponential backoff
-
+                time.sleep(2 ** attempt)
         raise Exception("Failed to get valid response from Gemini API after all retries")
-
     except Exception as e:
         st.error(f"Error making Gemini request: {str(e)}")
         raise
@@ -257,9 +246,7 @@ def generate_intent(keywords: List[Keyword]) -> IntentOutput:
     if not intent_response:
         raise Exception("Failed to generate intents.")
     
-    # Split the response into individual intents
     intents = [line.strip() for line in intent_response.split('\n') if line.strip()]
-    # Remove any numbering prefix (e.g., '1. ', '2. ')
     intents = [re.sub(r'^\d+\.\s*', '', intent) for intent in intents]
     
     return IntentOutput(intents=intents)
@@ -268,7 +255,6 @@ def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     Analyzes keywords and returns relevancy scores with descriptions in Thai.
     """
-    # Process all keywords at once
     keywords_list = "\n".join([f"{kw.term} ({kw.parsed_volume})" for kw in keywords])
     prompt = f"""
     Analyze the relevancy of ALL the following keywords based on the search intent:
@@ -304,18 +290,14 @@ def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     """
     try:
         result = make_gemini_request(prompt)
-        # Debug logging
         print(f"API Response: {result}")
 
-        # Clean the response if it contains extra text
         result = result.strip()
         if result.startswith('```json'):
             result = result.replace('```json', '').replace('```', '').strip()
 
-        # Parse JSON
         analysis = json.loads(result)
 
-        # Validate the structure
         for item in analysis:
             required_keys = ['keyword', 'volume', 'relevancy', 'description']
             if not all(key in item for key in required_keys):
@@ -345,10 +327,9 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     if not keywords:
         raise Exception("No valid keywords found in input. Make sure keywords are in format: term|volume")
 
-    # Get main keyword (first in the list)
     main_keyword = keywords[0]["term"]
 
-    # Step 2: Detect promotional entities in the search intent using LLM
+    # Step 2: Detect promotional entities
     promotional_entities = extract_promotional_entities(st.session_state.content_intent)
 
     # Step 3: Generate Title, Meta, and H1 with focus on main keyword
@@ -375,22 +356,18 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
 
     Return ONLY the JSON, no other text.
     """
-
     title_response = make_gemini_request(title_prompt)
     try:
-        # Clean the response if it contains markdown
         title_response = title_response.strip()
         if title_response.startswith('```json'):
             title_response = title_response.replace('```json', '').replace('```', '').strip()
 
         title_meta_h1 = json.loads(title_response)
 
-        # Validate the response
         required_keys = ["title", "metaDescription", "h1"]
         if not all(k in title_meta_h1 for k in required_keys):
             raise ValueError(f"Missing required keys. Got: {list(title_meta_h1.keys())}")
 
-        # Validate string values
         for k in required_keys:
             if not isinstance(title_meta_h1[k], str) or not title_meta_h1[k].strip():
                 raise ValueError(f"Invalid or empty value for {k}")
@@ -403,6 +380,15 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
         raise Exception(f"Error generating title/meta/H1: {str(e)}") from e
 
     # Step 4: Generate Content Structure
+    # เงื่อนไขสำหรับการรวมคำแนะนำเกี่ยวกับ meme coin เฉพาะเมื่อ main keyword เกี่ยวกับ meme
+    recent_insights_guideline = ""
+    if "meme" in main_keyword.lower():
+        recent_insights_guideline = """
+    5. Optionally, if it enhances the article’s relevance, include recent insights such as:
+       - Trump launching a meme coin.
+       - Elon Musk indirectly endorsing DOGE (for example, by naming his new Department of Government Efficiency DOGE).
+       - David Sacks (the new Crypto czar) stating that NFTs and meme coins are collectible.
+        """
     content_structure_prompt = f"""
     Create a detailed content structure in Thai for an article with main keyword: {main_keyword}
 
@@ -423,16 +409,16 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     4. If the search intent mentions any promotional entities (e.g., {', '.join(promotional_entities)}), integrate them naturally into the content sections without being overly promotional. Specifically:
        - Mention the promotional entity (e.g., {', '.join(promotional_entities)}) in at least one section's guidelines or details.
        - Ensure the mention feels natural and adds value to the content.
-
+    {recent_insights_guideline}
     For each section (except FAQs):
     1. Create an H2 heading in Thai that:
        - Reflects the search intent and semantic meaning.
        - Groups related keywords cohesively and logically.
        - Incorporates relevant keywords naturally (no forced usage).
-       - Avoids redundant or repetitive terms
+       - Avoids redundant or repetitive terms.
        - Expands into a natural sentence when using multiple keywords.
        - Flows logically from the previous heading.
-    2. Includes additional 1 or 2 semantically relevant content sections including {main_keyword} or select other keywords to enrich the content while maintaining alignment with the article's intent. 
+    2. Include 1 or 2 additional semantically relevant content subsections that enrich the topic while maintaining alignment with the article's intent.
     3. Provide the English translation of the H2 for Perplexity search.
     4. List target keywords with their search volumes that belong in this section.
     5. Combine reasoning, context, and guidelines into a single 'Details' field explaining the section's purpose and how to handle it.
@@ -446,6 +432,7 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
        - Address common queries related to the main topic.
        - Clarify complex concepts in simple terms.
        - Avoid duplicating information already covered in other sections.
+       - **Use modern Thai phrasing and avoid outdated pronouns such as "ฉัน".**
     4. Do NOT provide answers to the questions. Leave the answers blank for the content editor to research and fill in.
     5. For each question, generate a Perplexity research link using the English translation of the question, followed by "briefly explain in Thai".
 
@@ -468,7 +455,7 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
             "contentFormat": "Q&A format",
             "details": [
                 {{
-                    "question": "Question 1 in Thai",
+                    "question": "Question 1 in Thai (modern phrasing, e.g. หาข้อมูลเกี่ยวกับ [main keyword] ใหม่ๆ ได้ที่ไหน?)",
                     "researchLink": "https://www.perplexity.ai/search?q=English+translation+of+question+1+briefly+explain+in+Thai"
                 }},
                 {{
@@ -481,38 +468,15 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
         }}
         // More sections if needed...
     ]
-
-    Example section grouping:
-    1. Introduction/Definition Section:
-       - Groups basic "what is" and definition-related keywords
-       - Establishes foundational understanding
-    2. Core Information Section:
-       - Groups keywords about main features/benefits
-       - Covers essential knowledge
-    3. Detailed Analysis Section:
-       - Groups keywords about specific use cases/comparisons
-       - Provides in-depth information
-    4. Advanced Topics Section:
-       - Groups keywords about advanced concepts
-       - Covers expert-level information
-    5. Related Topics Section:
-       - Groups keywords about additional insights or related topics
-    6. FAQs Section:
-       - Groups semantically relevant questions to address common queries
-
-    Return ONLY the JSON array, no other text.
     """
-
     structure_response = make_gemini_request(content_structure_prompt)
     try:
-        # Clean the response if it contains markdown
         structure_response = structure_response.strip()
         if structure_response.startswith('```json'):
             structure_response = structure_response.replace('```json', '').replace('```', '').strip()
 
         content_structure = json.loads(structure_response)
 
-        # Validate the structure
         if not isinstance(content_structure, list):
             raise ValueError("Content structure must be a list")
 
@@ -521,11 +485,11 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
             if not all(key in section for key in required_keys):
                 raise ValueError(f"Missing required keys in section: {list(section.keys())}")
 
-            # Add Perplexity link with promotional entities included
             if promotional_entities:
-                section["perplexityLink"] = f"https://www.perplexity.ai/search?q={'+'.join(section['headingEnglish'].split())}+{'+'.join(promotional_entities)}+.+Explain+in+Thai"
+                query = f"{section['headingEnglish']} {' '.join(promotional_entities)}. Explain in Thai"
             else:
-                section["perplexityLink"] = f"https://www.perplexity.ai/search?q={'+'.join(section['headingEnglish'].split())}+.+Explain+in+Thai"
+                query = f"{section['headingEnglish']}. Explain in Thai"
+            section["perplexityLink"] = "https://www.perplexity.ai/search?q=" + quote_plus(query)
 
     except json.JSONDecodeError as e:
         raise Exception(f"Failed to parse content structure response as JSON. Response: {structure_response[:200]}...") from e
@@ -534,7 +498,6 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     except Exception as e:
         raise Exception(f"Error generating content structure: {str(e)}") from e
 
-    # Assemble SEO Plan
     seo_plan = SEOPlan(
         title_meta_h1=TitleMetaH1(**title_meta_h1),
         content_structure=[Section(**section) for section in content_structure]
@@ -546,7 +509,6 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
 st.set_page_config(page_title="SEO Content Recommender", layout="wide")
 st.title("SEO Content Recommender")
 
-# Add radio button to select brief type (Internal by default)
 brief_type = st.radio(
     "Select Brief Type:",
     options=["Internal", "External"],
@@ -554,7 +516,6 @@ brief_type = st.radio(
     key="brief_type"
 )
 
-# Initialize session state variables if they don't exist
 if 'analyzed_keywords' not in st.session_state:
     st.session_state.analyzed_keywords = []
 if 'keyword_selections' not in st.session_state:
@@ -600,10 +561,8 @@ def display_analyzed_keywords():
     st.markdown(f"**Total Monthly Search Volume**: {total_volume:,}")
     return total_volume
 
-# Input text area for keywords
 raw_input = st.text_area("Enter your keywords:", height=200)
 
-# First step: Generate Content Intent
 if st.button("Suggest Intent"):
     if raw_input:
         try:
@@ -623,7 +582,6 @@ if st.button("Suggest Intent"):
     else:
         st.warning("Please enter some keywords first.")
 
-# Show intent selection if intents were generated
 if st.session_state.intent_generated:
     st.subheader("Select Content Intent:")
     st.write("Choose one of the following content intents that best matches your goals:")
@@ -644,7 +602,6 @@ if st.session_state.intent_generated:
     )
     st.session_state.content_intent = edited_intent
 
-# Show analyze button only if we have keywords
 if st.session_state.intent_generated:
     if st.button("Analyze Keyword Relevancy"):
         try:
@@ -662,7 +619,6 @@ if st.session_state.intent_generated:
 if st.session_state.analyzed_keywords:
     display_analyzed_keywords()
 
-# Only show the SEO Plan button if we have both keywords and intent
 if st.session_state.intent_generated and st.session_state.analyzed_keywords:
     if st.button("Generate Full SEO Plan"):
         try:
@@ -713,22 +669,19 @@ if st.session_state.intent_generated and st.session_state.analyzed_keywords:
                     st.markdown("**Related Concepts**: " + ", ".join(section.relatedConcepts))
                     st.markdown(f"**Content Format**: {section.contentFormat}")
                     
-                    # For FAQ section (where details is a list) or regular sections,
-                    # only show perplexity/research links for Internal briefs.
                     if isinstance(section.details, list):  # FAQ section
                         st.markdown("**Guidelines:**")
                         for qa in section.details:
                             st.markdown(f"- **{qa['question']}**")
                             if st.session_state.brief_type == "Internal":
                                 st.markdown(f"  Research: [{qa['researchLink']}]({qa['researchLink']})")
-                    else:  # Regular section
+                    else:
                         st.markdown(f"**Guidelines:** {section.details}")
                         if st.session_state.brief_type == "Internal":
                             st.markdown(f"**Research:** [{section.perplexityLink}]({section.perplexityLink})")
                     
                     st.markdown("---")
 
-                # Append extra guidelines if the brief is External
                 if st.session_state.brief_type == "External":
                     external_guidelines = """
 กฎหลักๆ:
