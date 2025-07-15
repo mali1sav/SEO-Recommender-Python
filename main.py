@@ -27,10 +27,10 @@ def init_gemini_client():
             return None
 
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
+        model = genai.GenerativeModel('gemini-2.5-pro')
         return {
             'model': model,
-            'name': 'gemini-2.0-flash-exp'
+            'name': 'gemini-2.5-pro'
         }
     except Exception as e:
         st.error(f"Failed to initialize Gemini client: {str(e)}")
