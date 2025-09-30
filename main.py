@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import time
 from urllib.parse import quote_plus  # สำหรับการเข้ารหัส URL
 
 import requests
@@ -10,36 +9,32 @@ from typing import List, Dict, Optional, Union
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 import streamlit as st
-import google.generativeai as genai
 import tenacity
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize Gemini client
-def init_gemini_client():
-    """Initialize Google Gemini client."""
-    try:
-        api_key = os.getenv('GEMINI_API_KEY')
-        if not api_key:
-            st.error("Gemini API key not found. Please set GEMINI_API_KEY in your environment variables.")
-            return None
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-pro')
-        return {
-            'model': model,
-            'name': 'gemini-2.5-pro'
-        }
-    except Exception as e:
-        st.error(f"Failed to initialize Gemini client: {str(e)}")
+# Initialize OpenRouter client
+def init_openrouter_client():
+    """Initialize OpenRouter configuration."""
+    api_key = os.getenv('OPENROUTER_API_KEY')
+    if not api_key:
+        st.error("OpenRouter API key not found. Please set OPENROUTER_API_KEY in your environment variables.")
         return None
 
-# Initialize Gemini client
-gemini_client = init_gemini_client()
-if not gemini_client:
-    raise EnvironmentError("Failed to initialize Gemini client.")
+    return {
+        'api_key': api_key,
+        'api_url': os.getenv('OPENROUTER_API_URL', 'https://openrouter.ai/api/v1/chat/completions'),
+        'model': os.getenv('OPENROUTER_MODEL', 'google/gemini-2.5-flash-preview-09-2025'),
+        'site_url': os.getenv('OPENROUTER_SITE_URL', ''),
+        'app_name': os.getenv('OPENROUTER_APP_NAME', 'SEO Content Recommender')
+    }
+
+# Initialize OpenRouter configuration
+openrouter_client = init_openrouter_client()
+if not openrouter_client:
+    raise EnvironmentError("Failed to initialize OpenRouter client.")
 
 # Define Pydantic Models
 class KeywordInput(BaseModel):
@@ -148,10 +143,15 @@ def create_session():
 
 def extract_promotional_entities(intent: str) -> List[str]:
     """
-    Rotates promotional entities with brand rotation list.
+    Returns provided promotional entities, or defaults to ["Best Wallet"].
+    Emphasizes user-provided entities without any brand rotation.
     """
-    idx = int(time.time()) % len(BRAND_ROTATION)
-    return BRAND_ROTATION[idx:idx+2]
+    custom_entities_raw = st.session_state.get("custom_promotional_entities", "").strip()
+    if custom_entities_raw:
+        return [entity.strip() for entity in re.split(r'[\n,]+', custom_entities_raw) if entity.strip()]
+
+    # Default emphasis entity when none provided
+    return ["Best Wallet"]
 
 session = create_session()
 
@@ -161,22 +161,55 @@ session = create_session()
     retry=tenacity.retry_if_exception_type((Exception)),
     retry_error_callback=lambda retry_state: None
 )
-def make_gemini_request(prompt: str) -> str:
-    """Make Gemini API request with retries and proper error handling"""
+def make_openrouter_request(prompt: str) -> str:
+    """Make OpenRouter API request with retries and proper error handling."""
     try:
-        for attempt in range(3):
-            try:
-                response = gemini_client['model'].generate_content(prompt)
-                if response and response.text:
-                    return response.text
-            except Exception as e:
-                if attempt == 2:
-                    raise
-                st.warning(f"Retrying Gemini request (attempt {attempt + 2}/3)...")
-                time.sleep(2 ** attempt)
-        raise Exception("Failed to get valid response from Gemini API after all retries")
+        headers = {
+            "Authorization": f"Bearer {openrouter_client['api_key']}",
+            "Content-Type": "application/json"
+        }
+        if openrouter_client.get('site_url'):
+            headers["HTTP-Referer"] = openrouter_client['site_url']
+        if openrouter_client.get('app_name'):
+            headers["X-Title"] = openrouter_client['app_name']
+
+        payload = {
+            "model": openrouter_client['model'],
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+
+        response = session.post(
+            openrouter_client['api_url'],
+            headers=headers,
+            json=payload,
+            timeout=60
+        )
+
+        if response.status_code == 429:
+            detail = response.json().get('error', {}).get('message', response.text)
+            raise RuntimeError(f"OpenRouter rate limit reached: {detail}")
+
+        response.raise_for_status()
+        data = response.json()
+
+        choices = data.get('choices')
+        if not choices:
+            raise ValueError("OpenRouter response did not include choices.")
+
+        message_content = choices[0].get('message', {}).get('content')
+        if not message_content:
+            raise ValueError("OpenRouter response missing message content.")
+
+        if isinstance(message_content, list):
+            text = "".join(part.get('text', '') for part in message_content)
+        else:
+            text = message_content
+
+        return text.strip()
     except Exception as e:
-        st.error(f"Error making Gemini request: {str(e)}")
+        st.error(f"Error making OpenRouter request: {str(e)}")
         raise
 
 CONTENT_TYPES = [
@@ -195,13 +228,7 @@ CONTENT_STRUCTURES = [
     "Q&A format"
 ]
 
-BRAND_ROTATION = [
-    "BestWallet.com/th",
-    "MetaMask",
-    "Trust Wallet",
-    "Binance Wallet",
-    "Coinbase Wallet"
-]
+# Brand rotation removed; emphasis on provided entity with default "Best Wallet".
 
 def rotate_keywords(keywords: List[Keyword], num_groups=5) -> List[List[str]]:
     """Split keywords into rotating groups"""
@@ -216,8 +243,17 @@ def generate_intent(keywords: List[Keyword]) -> IntentOutput:
     if not keywords:
         raise Exception("Keyword list is empty.")
         
+    primary_keyword = keywords[0].term
+    supporting_keywords = [kw.term for kw in keywords[1:]]
     keywords_list = "\n".join([kw.term for kw in keywords])
+    supporting_text = ", ".join(supporting_keywords) if supporting_keywords else "(no supporting keywords provided)"
+
     prompt = f"""
+    You are an SEO strategist who must always prioritise the primary keyword.
+    Primary keyword (treat as the main topic and mention first in every intent without quotes/backticks): {primary_keyword}
+    Supporting keywords (use naturally after the primary keyword): {supporting_text}
+    Promotional entities (weave in only if helpful and natural; prefer earlier sections and concrete steps): {', '.join(extract_promotional_entities('')) or 'Best Wallet'}
+
     Generate 5 distinct Thai content intents that are comprehensive and detailed (around 2-3 sentences each). You can use the following example formats or come up with better ones:
 
     1. Listicle: "10 ข้อควรรู้เกี่ยวกับ [main keyword]" 
@@ -226,14 +262,18 @@ def generate_intent(keywords: List[Keyword]) -> IntentOutput:
     4. Expert: "ผู้เชี่ยวชาญเผย [insight] เกี่ยวกับ [main keyword]"
     5. Problem-Solving: "แก้ไขปัญหา [common issue] ด้วย [solution]"
 
-    Keywords: {keywords_list}
+    Keywords in order of priority: {keywords_list}
 
     Return EXACTLY 5 intents in Thai that:
-    1. Captures the main topic from a unique and engaging angle
-    2. Addresses a variety of user questions and search intents
-    3. Provides a detailed flow for content structure with context and additional information
-    4. Uses natural Thai language while retaining SEO keywords in their original form, whether in Thai or English
-    5. Is comprehensive and detailed (around 2-3 sentences) to help in generating a rich content structure
+    1. Start by naturally mentioning the primary keyword within the first clause (first 12 words)
+    2. Keep the primary keyword in plain text (no quotes, backticks, or brackets)
+    3. Capture the main topic from a unique and engaging angle
+    4. Address a variety of user questions and search intents
+    5. Provide a detailed flow for content structure with context and additional information
+    6. Where suitable, naturally mention one promotional entity (e.g., Best Wallet) as part of a concrete action or example, not an ad; avoid forced mentions.
+    7. Prefer placing such mention earlier when it fits (e.g., step-by-step or tools section), not only in the last section.
+    8. Use natural Thai language while retaining supporting keywords in their original form, whether in Thai or English
+    9. Are comprehensive and detailed (around 2-3 sentences) to help in generating a rich content structure
 
     Return EXACTLY 5 intents in Thai, one per line, numbered from 1-5. Do not include any extra explanation.
 
@@ -244,7 +284,7 @@ def generate_intent(keywords: List[Keyword]) -> IntentOutput:
     4. แนวทางการ [topic] ที่ช่วยให้เข้าใจในเชิงลึก พร้อมแนะนำเทคนิคและวิธีการปฏิบัติจริง
     5. ความสำคัญของ [topic] ในบริบทของ [impact] พร้อมให้ข้อมูลที่ครบถ้วนและแนวทางการปรับปรุงในอนาคต
     """
-    intent_response = make_gemini_request(prompt)
+    intent_response = make_openrouter_request(prompt)
     if not intent_response:
         raise Exception("Failed to generate intents.")
     
@@ -291,7 +331,7 @@ def analyze_keyword_relevancy(keywords: List[Keyword]) -> List[Dict]:
     Only return JSON array, no additional text or explanation.
     """
     try:
-        result = make_gemini_request(prompt)
+        result = make_openrouter_request(prompt)
         print(f"API Response: {result}")
 
         result = result.strip()
@@ -333,8 +373,16 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
 
     # Step 2: Detect promotional entities
     promotional_entities = extract_promotional_entities(st.session_state.content_intent)
+    promotional_entities_text = ", ".join(promotional_entities)
 
     # Step 3: Generate Title, Meta, and H1 with focus on main keyword
+    helpful_clause = "    5. Keeps the tone helpful and aligned with the search intent without unnecessary promotion.\n"
+    title_promo_clause = ""
+    if promotional_entities:
+        title_promo_clause = (
+            f"    6. When it benefits the reader, naturally reference promotional entities such as {promotional_entities_text} to illustrate solutions or cautions without sounding salesy or forced.\n"
+        )
+
     title_prompt = f"""
     Based on this main keyword: {main_keyword}
     And these supporting keywords:
@@ -347,7 +395,7 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
     2. Uses supporting keywords where natural
     3. Is compelling, engaging and click-worthy
     4. Stays within character limits (title: 60 chars, meta: 155 chars)
-    5. Does NOT include promotional content like "{', '.join(promotional_entities)}" unless it is part of the main topic.
+{helpful_clause}{title_promo_clause}
 
     Return in this exact JSON format:
     {{
@@ -358,7 +406,7 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
 
     Return ONLY the JSON, no other text.
     """
-    title_response = make_gemini_request(title_prompt)
+    title_response = make_openrouter_request(title_prompt)
     try:
         title_response = title_response.strip()
         if title_response.startswith('```json'):
@@ -391,6 +439,15 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
        - Elon Musk indirectly endorsing DOGE (for example, by naming his new Department of Government Efficiency DOGE).
        - David Sacks (the new Crypto czar) stating that NFTs and meme coins are collectible.
         """
+
+    content_structure_promo_guideline = ""
+    if promotional_entities:
+        content_structure_promo_guideline = (
+            f"    4. When it helps readers achieve the intent, weave promotional entities such as {promotional_entities_text} into the most relevant sections. Keep the guidance informative and practical, avoiding sales language.\n"
+            "       - Prefer placing the first mention in section 2 or 3 if appropriate (e.g., getting started, step-by-step, or tool setup).\n"
+            "       - Aim to mention each promotional entity at least once where it fits naturally.\n"
+            "       - Explain why it matters for the reader (e.g., strengths, cautions, or use cases).\n"
+        )
     content_structure_prompt = f"""
     Create a detailed content structure in Thai for an article with main keyword: {main_keyword}
 
@@ -408,10 +465,7 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
        - Core Concepts & Main Information
        - Detailed Analysis & Advanced Topics
        - Related Subtopics and Additional Insights
-    4. If the search intent mentions any promotional entities (e.g., {', '.join(promotional_entities)}), integrate them naturally into the content sections without being overly promotional. Specifically:
-       - Mention the promotional entity (e.g., {', '.join(promotional_entities)}) in at least one section's guidelines or details.
-       - Ensure the mention feels natural and adds value to the content.
-    {recent_insights_guideline}
+{content_structure_promo_guideline}{recent_insights_guideline}
     For each section (except FAQs):
     1. Create an H2 heading in Thai that:
        - Reflects the search intent and semantic meaning.
@@ -420,8 +474,8 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
        - Avoids redundant or repetitive terms.
        - Expands into a natural sentence when using multiple keywords.
        - Flows logically from the previous heading.
-    2. Include 1 or 2 additional semantically relevant content subsections that enrich the topic while maintaining alignment with the article's intent.
-    3. Provide the English translation of the H2 for Perplexity search.
+    2. Include 1 or 2 additional semantically relevant content subsections that enrich the topic while maintaining alignment with the article's intent. If a promotional entity fits, blend it into actionable steps or examples.
+    3. Provide the English translation of the H2, ensure comprehensive and cover all the main points which is key for getting the most out of Perplexity search.
     4. List target keywords with their search volumes that belong in this section.
     5. Combine reasoning, context, and guidelines into a single 'Details' field explaining the section's purpose and how to handle it.
     6. List 3-5 related concepts to enhance semantic coverage.
@@ -471,7 +525,7 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
         // More sections if needed...
     ]
     """
-    structure_response = make_gemini_request(content_structure_prompt)
+    structure_response = make_openrouter_request(content_structure_prompt)
     try:
         structure_response = structure_response.strip()
         if structure_response.startswith('```json'):
@@ -487,10 +541,8 @@ def full_seo_plan(keyword_input: KeywordInput) -> SEOPlan:
             if not all(key in section for key in required_keys):
                 raise ValueError(f"Missing required keys in section: {list(section.keys())}")
 
-            if promotional_entities:
-                query = f"{section['headingEnglish']} {' '.join(promotional_entities)}. Explain in Thai"
-            else:
-                query = f"{section['headingEnglish']}. Explain in Thai"
+            # Build a clean research query; keep entities out of the core question
+            query = f"{section['headingEnglish']}. Explain in Thai"
             section["perplexityLink"] = "https://www.perplexity.ai/search?q=" + quote_plus(query)
 
     except json.JSONDecodeError as e:
@@ -528,6 +580,9 @@ if 'keywords' not in st.session_state:
     st.session_state.keywords = []
 if 'intent_generated' not in st.session_state:
     st.session_state.intent_generated = False
+if 'custom_promotional_entities' not in st.session_state:
+    # Active default so it's used, not just a placeholder
+    st.session_state.custom_promotional_entities = "Best Wallet"
 
 def display_analyzed_keywords():
     if 'analyzed_keywords' not in st.session_state:
@@ -565,6 +620,12 @@ def display_analyzed_keywords():
 
 raw_input = st.text_area("Enter your keywords:", height=200)
 
+st.text_input(
+    "Optional promotional entities (comma or newline separated):",
+    value=st.session_state.custom_promotional_entities,
+    key="custom_promotional_entities"
+)
+
 if st.button("Suggest Intent"):
     if raw_input:
         try:
@@ -578,7 +639,7 @@ if st.button("Suggest Intent"):
                 st.session_state.content_intents = intent_output.intents
                 st.session_state.intent_generated = True
 
-                st.experimental_rerun()
+                st.rerun()
         except Exception as e:
             st.error(f"Error: {str(e)}")
     else:
